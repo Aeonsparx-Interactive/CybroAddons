@@ -23,3 +23,5 @@ from . import zk_machine
 from . import machine_analysis
 from . import zklib
 
+# HACK To by pass the error message "invalid field device_id"
+from . import hr_employee_public
