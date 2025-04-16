@@ -28,3 +28,8 @@ class HrEmployee(models.Model):
 
     device_id_num = fields.Char(string='Biometric Device ID',
                                 help="Give the biometric device id")
+
+class EmployeePublic(models.Model):
+    _inherit = 'hr.employee.public'
+
+    device_id_num = fields.Char(readonly=True)
