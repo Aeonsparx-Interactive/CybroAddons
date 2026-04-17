@@ -20,27 +20,23 @@
 #
 ###################################################################################
 import pytz
-import sys
-import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
-import binascii
+from struct import unpack
+from itertools import groupby
 
 from . import zklib
 from .zkconst import *
-from struct import unpack
-from odoo import api, fields, models
-from odoo import _
+from odoo import api, fields, models, _
 from odoo.exceptions import UserError, ValidationError
-from itertools import groupby
 
+# FIX: removed duplicate _logger definition
 _logger = logging.getLogger(__name__)
+
 try:
     from zk import ZK, const
 except ImportError:
     _logger.error("Please Install pyzk library.")
-
-_logger = logging.getLogger(__name__)
 
 
 class HrAttendance(models.Model):
@@ -50,10 +46,7 @@ class HrAttendance(models.Model):
 
     @api.constrains("check_in", "check_out", "employee_id")
     def _check_validity(self):
-        """Customization
-        To remove the constraint checking
-        """
-        # return False
+        """Customization: constraint checking removed."""
 
     def _check_validity_check_in_check_out(self):
         """"""
@@ -75,70 +68,76 @@ class ZkMachine(models.Model):
         try:
             conn = zk.connect()
             return conn
-        except:
+        except Exception:
             return False
 
     def clear_attendance(self):
         for info in self:
+            machine_ip = info.name
+            zk_port = info.port_no
+            timeout = 30
             try:
-                machine_ip = info.name
-                zk_port = info.port_no
-                timeout = 30
-                try:
-                    zk = ZK(
-                        machine_ip,
-                        port=zk_port,
-                        timeout=timeout,
-                        password=0,
-                        force_udp=False,
-                        ommit_ping=False,
+                zk = ZK(
+                    machine_ip,
+                    port=zk_port,
+                    timeout=timeout,
+                    password=0,
+                    force_udp=False,
+                    ommit_ping=False,
+                )
+            except NameError:
+                raise UserError(_("Please install pyzk with 'pip3 install pyzk'."))
+
+            conn = self.device_connect(zk)
+            if not conn:
+                raise UserError(
+                    _(
+                        "Unable to connect to Attendance Device. "
+                        "Please use the Test Connection button to verify."
                     )
-                except NameError:
-                    raise UserError(_("Please install it with 'pip3 install pyzk'."))
-                conn = self.device_connect(zk)
-                if conn:
-                    conn.enable_device()
-                    clear_data = zk.get_attendance()
-                    if clear_data:
-                        self._cr.execute("""delete from zk_machine_attendance""")
-                        # conn.clear_attendance()
-                        conn.disconnect()
-                    else:
-                        raise UserError(
-                            _(
-                                "Unable to clear Attendance log. Are you sure attendance log is not empty."
-                            )
-                        )
+                )
+
+            try:
+                conn.enable_device()
+                clear_data = zk.get_attendance()
+                if clear_data:
+                    self._cr.execute("DELETE FROM zk_machine_attendance")
+                    # conn.clear_attendance()
                 else:
                     raise UserError(
                         _(
-                            "Unable to connect to Attendance Device. Please use Test Connection button to verify."
+                            "Unable to clear Attendance log. "
+                            "Are you sure the attendance log is not empty?"
                         )
                     )
-            except:
+            except UserError:
+                raise
+            except Exception as e:
+                _logger.exception("Error clearing attendance: %s", e)
                 raise ValidationError(
-                    "Unable to clear Attendance log. Are you sure attendance device is connected & record is not empty."
+                    _(
+                        "Unable to clear Attendance log. "
+                        "Are you sure the attendance device is connected and the record is not empty?"
+                    )
                 )
+            finally:
+                conn.disconnect()
 
     def getSizeUser(self, zk):
-        """Checks a returned packet to see if it returned CMD_PREPARE_DATA,
-        indicating that data packets are to be sent
-
-        Returns the amount of bytes that are going to be sent"""
+        """Checks a returned packet for CMD_PREPARE_DATA and returns byte count."""
         command = unpack("HHHH", zk.data_recv[:8])[0]
         if command == CMD_PREPARE_DATA:
             size = unpack("I", zk.data_recv[8:12])[0]
-            print("size", size)
+            _logger.debug("getSizeUser size: %s", size)
             return size
-        else:
-            return False
+        return False
 
     def zkgetuser(self, zk):
-        """Start a connection with the time clock"""
+        """Fetch users from the time clock device."""
         try:
             users = zk.get_users()
             return users
-        except:
+        except Exception:
             return False
 
     @api.model
@@ -151,10 +150,12 @@ class ZkMachine(models.Model):
         _logger.info("++++++++++++Cron Executed++++++++++++++++++++++")
         zk_attendance = self.env["zk.machine.attendance"]
         att_obj = self.env["hr.attendance"]
+
         for info in self:
             machine_ip = info.name
             zk_port = info.port_no
             timeout = 15
+
             try:
                 zk = ZK(
                     machine_ip,
@@ -167,191 +168,181 @@ class ZkMachine(models.Model):
             except NameError:
                 raise UserError(
                     _(
-                        "Pyzk module not Found. Please install it with 'pip3 install pyzk'."
+                        "Pyzk module not found. "
+                        "Please install it with 'pip3 install pyzk'."
                     )
                 )
+
             conn = self.device_connect(zk)
-            if conn:
-                # conn.disable_device() #Device Cannot be used during this time.
+            if not conn:
+                raise UserError(
+                    _(
+                        "Unable to connect. "
+                        "Please check the parameters and network connections."
+                    )
+                )
+
+            try:
                 try:
                     device_users = conn.get_users()
-                except:
+                except Exception:
                     device_users = False
 
                 if not device_users:
                     raise UserError(
                         _(
-                            "There is no user created yet. Please create at least one user."
+                            "There are no users on the device yet. "
+                            "Please create at least one user."
                         )
                     )
 
                 try:
                     attendance = conn.get_attendance()
-                    attendance.sort(key=lambda x: int(x.user_id), reverse=False)
-                    grouped_attendances = [
-                        list(group)
-                        for key, group in groupby(
-                            iterable=attendance, key=lambda x: x.user_id
-                        )
-                    ]
                 except Exception as e:
-                    attendance = False
-                    grouped_attendances = False
-                # return;
-                if grouped_attendances:
-                    non_existence_employees = []
+                    _logger.exception("Failed to fetch attendance: %s", e)
+                    attendance = []
 
-                    for i, each_user_attendances in enumerate(grouped_attendances):
-
-                        each_user_attendances.sort(key=lambda x: x.timestamp)
-                        for j, attendance in enumerate(each_user_attendances):
-                            employee = self.env["hr.employee"].search(
-                                [("device_id", "=", attendance.user_id)]
-                            )
-
-                            if employee:
-                                # Converting datetime
-                                atten_time = attendance.timestamp
-                                atten_time = datetime.strptime(
-                                    atten_time.strftime("%Y-%m-%d %H:%M:%S"),
-                                    "%Y-%m-%d %H:%M:%S",
-                                )
-                                local_tz = pytz.timezone(
-                                    self.env.user.partner_id.tz or "GMT"
-                                )
-                                local_dt = local_tz.localize(atten_time, is_dst=None)
-                                utc_dt = local_dt.astimezone(pytz.utc)
-                                utc_dt = utc_dt.strftime("%Y-%m-%d %H:%M:%S")
-                                atten_time = datetime.strptime(
-                                    utc_dt, "%Y-%m-%d %H:%M:%S"
-                                )
-                                atten_time_str = fields.Datetime.to_string(atten_time)
-                                # End Converting datetime
-                                db_attendances = att_obj.search(
-                                    domain=[
-                                        ("employee_id", "=", employee[0].id),
-                                        "|",
-                                        ("check_in", "<=", atten_time_str),
-                                        ("check_out", "=", False),
-                                    ],
-                                    order="id",
-                                )
-
-                                # if local_dt.strftime('%Y-%m-%d') <= "2023-02-10":
-                                #     continue
-
-                                # zk_machine_table
-                                # searching for record
-                                duplicate_atten_ids = zk_attendance.search(
-                                    [
-                                        ("device_id", "=", attendance.user_id),
-                                        ("punching_time", "=", atten_time),
-                                    ]
-                                )
-
-                                if not duplicate_atten_ids:
-                                    zk_attendance.create(
-                                        {
-                                            "employee_id": employee[0].id,
-                                            "device_id": attendance.user_id,
-                                            "attendance_type": str(attendance.status),
-                                            "punch_type": str(attendance.punch),
-                                            "punching_time": atten_time,
-                                            "address_id": info.address_id.id,
-                                        }
-                                    )
-
-                                    # if no record found
-                                    if not db_attendances:
-                                        att_obj.create(
-                                            {
-                                                "employee_id": employee[0].id,
-                                                "check_in": atten_time,
-                                            }
-                                        )
-                                    else:
-                                        record = db_attendances[-1]
-                                        check_in = record.check_in
-                                        check_out = record.check_out
-
-                                        if check_out == False:
-                                            if local_dt.date() == check_in.astimezone(
-                                                local_tz
-                                            ).date() or (
-                                                (    
-                                                    local_dt
-                                                    - check_in.astimezone(local_tz)
-                                                ) / timedelta(hours=1)
-                                                < 24
-                                            ):
-                                                record.write({"check_out": atten_time})
-                                                continue
-                                        # Fix duplicated checked in
-                                        # if check_out and current_attendance at the same day
-                                        # overwrite it
-                                        elif (
-                                            check_out.astimezone(local_tz).date()
-                                            == local_dt.date()
-                                        ):
-                                            record.write({"check_out": atten_time})
-                                            continue
-
-                                        # if nothing above match, create a new record
-                                        att_obj.create(
-                                            (
-                                                {
-                                                    "employee_id": employee[0].id,
-                                                    "check_in": atten_time,
-                                                }
-                                            )
-                                        )
-                                        continue
-                            else:
-                                ### Exclude inactive employee
-                                inactive_employee = self.env["hr.employee"].search(
-                                    [
-                                        ("device_id", "=", attendance.user_id),
-                                        ("active", "=", False)
-                                    ]
-                                )
-                                for device_user in device_users:                              
-                                    if not inactive_employee and device_user.user_id == attendance.user_id:
-                                        non_existence_employees.append(device_user)
-                                break
-
-                    ### Raise Non Existence Employees Error
-                    if non_existence_employees:
-                        """
-                        If there is no biometric device id found in employees,
-                        raise an exception/warning instead of create the new employee
-                        """
-                        self.non_existence_employee_error(non_existence_employees)
-
-                    # zk.enableDevice()
-                    conn.disconnect
-                    return True
-                else:
+                if not attendance:
                     raise UserError(
                         _("Unable to get the attendance log, please try again later.")
                     )
-            else:
-                raise UserError(
-                    _(
-                        "Unable to connect, please check the parameters and network connections."
+
+                # Pre-fetch lookups to avoid per-record DB queries
+                all_employees = self.env["hr.employee"].search(
+                    [("device_id", "!=", False)]
+                )
+                employee_map = {emp.device_id: emp for emp in all_employees}
+
+                # Also pre-fetch inactive employees to quickly skip them
+                inactive_employees = self.env["hr.employee"].search(
+                    [("device_id", "!=", False), ("active", "=", False)]
+                )
+                inactive_device_ids = {emp.device_id for emp in inactive_employees}
+
+                # Build a map of device_user.user_id -> device_user for fast lookup
+                device_user_map = {str(u.user_id): u for u in device_users}
+
+                # Pre-fetch all existing zk_attendance punch times
+                # keyed by (device_id, punching_time) to avoid per-record searches.
+                existing_zk = zk_attendance.search([])
+                existing_zk_set = {
+                    (r.device_id, fields.Datetime.to_string(r.punching_time))
+                    for r in existing_zk
+                }
+
+                local_tz = pytz.timezone(self.env.user.partner_id.tz or "GMT")
+
+                attendance.sort(key=lambda x: int(x.user_id))
+                grouped_attendances = [
+                    list(group)
+                    for _, group in groupby(attendance, key=lambda x: x.user_id)
+                ]
+
+                non_existence_employees = []
+
+                for each_user_attendances in grouped_attendances:
+                    each_user_attendances.sort(key=lambda x: x.timestamp)
+
+                    # All records in this group share the same user_id
+                    user_id = each_user_attendances[0].user_id
+                    employee = employee_map.get(str(user_id))
+
+                    if not employee:
+                        # Skip inactive; collect truly unknown users
+                        if str(user_id) not in inactive_device_ids:
+                            device_user = device_user_map.get(str(user_id))
+                            if device_user:
+                                non_existence_employees.append(device_user)
+                        continue
+
+                    # Fetch all existing hr.attendance records for
+                    # this employee once per user, not once per punch record.
+                    db_attendances = att_obj.search(
+                        [("employee_id", "=", employee.id)],
+                        order="id",
                     )
-                )
 
-    def non_existence_employee_error(self, non_existence_employees=[]):
-        logs = ""
+                    for attendance_rec in each_user_attendances:
+                        atten_time = datetime.strptime(
+                            attendance_rec.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                            "%Y-%m-%d %H:%M:%S",
+                        )
+                        local_dt = local_tz.localize(atten_time, is_dst=None)
+                        utc_dt = local_dt.astimezone(pytz.utc)
+                        atten_time = datetime.strptime(
+                            utc_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                            "%Y-%m-%d %H:%M:%S",
+                        )
+                        atten_time_str = fields.Datetime.to_string(atten_time)
+
+                        if (str(user_id), atten_time_str) in existing_zk_set:
+                            continue
+
+                        # Record is new — insert into zk_attendance staging table
+                        zk_attendance.create(
+                            {
+                                "employee_id": employee.id,
+                                "device_id": str(user_id),
+                                "attendance_type": str(attendance_rec.status),
+                                "punch_type": str(attendance_rec.punch),
+                                "punching_time": atten_time,
+                                "address_id": info.address_id.id,
+                            }
+                        )
+                        # Add to the in-memory set so subsequent records in this
+                        # batch don't trigger duplicate DB inserts
+                        existing_zk_set.add((str(user_id), atten_time_str))
+
+                        # Get the single most recent hr.attendance record whose
+                        # check_in is before the current punch time.
+                        prior = [r for r in db_attendances if r.check_in <= atten_time]
+                        record = prior[-1] if prior else None
+
+                        if record:
+                            check_in = record.check_in
+                            check_out = record.check_out
+                            check_in_local = check_in.astimezone(local_tz)
+
+                            same_day = local_dt.date() == check_in_local.date()
+                            within_24h = (local_dt - check_in_local) / timedelta(
+                                hours=1
+                            ) < 24
+                            open_and_recent = not check_out and (same_day or within_24h)
+                            same_day_checkout = (
+                                check_out
+                                and check_out.astimezone(local_tz).date()
+                                == local_dt.date()
+                            )
+
+                            if open_and_recent or same_day_checkout:
+                                record.write({"check_out": atten_time})
+                                continue
+                            # else: record is too old or already closed on a different
+                            # day — fall through to create a new check-in below
+
+                        # No suitable open record found — create a new check-in
+                        new_rec = att_obj.create(
+                            {
+                                "employee_id": employee.id,
+                                "check_in": atten_time,
+                            }
+                        )
+                        db_attendances |= new_rec
+
+                if non_existence_employees:
+                    self.non_existence_employee_error(non_existence_employees)
+
+            finally:
+                conn.disconnect()
+
+        return True
+
+    def non_existence_employee_error(self, non_existence_employees=None):
+        if not non_existence_employees:
+            return
         for index, device_user in enumerate(non_existence_employees):
-            logs += "\r\n======\r\n{}. Name: {}\r\nBiometric Device ID: {}".format(
-                index + 1, device_user.name, device_user.user_id
-            )
-
-        raise UserError(
-            _(
-                "The following user(s) is haven't linked or created{}\r\n======".format(
-                    logs
+            _logger.warning(
+                "Biometric ID: {} are not linked to employee: {}".format(
+                    device_user.user_id, device_user.name
                 )
             )
-        )
