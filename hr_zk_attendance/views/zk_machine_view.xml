@@ -24,7 +24,12 @@
                             <field name="address_id"/>
                         </group>
                         <group>
+                            <field name="machine_timezone"/>
+                            <field name="cutoff_hour"/>
                             <field name="company_id" groups="base.group_multi_company"/>
+                        </group>
+                        <group>
+                            <field name="last_sync_time"/>
                         </group>
                     </group>
                 </sheet>
@@ -40,6 +45,8 @@
                 <field name="name"/>
                 <field name="port_no"/>
                 <field name="address_id"/>
+                <field name="machine_timezone"/>
+                <field name="last_sync_time"/>
                 <field name="company_id" groups="base.group_multi_company"/>
             </tree>
         </field>

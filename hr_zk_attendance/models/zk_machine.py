@@ -20,12 +20,11 @@
 #
 ###################################################################################
 import pytz
-from datetime import datetime, timedelta
 import logging
 from struct import unpack
 from itertools import groupby
 
-from . import zklib
+from . import zk_pairing
 from .zkconst import *
 from odoo import api, fields, models, _
 from odoo.exceptions import UserError, ValidationError
@@ -63,6 +62,42 @@ class ZkMachine(models.Model):
         string="Company",
         default=lambda self: self.env.user.company_id.id,
     )
+    machine_timezone = fields.Char(
+        string="Machine Timezone",
+        required=True,
+        default=lambda self: self.env.user.tz or "Asia/Kuala_Lumpur",
+        help="IANA timezone of the wall clock shown on the biometric device. "
+        "Punch timestamps from the device are interpreted in this timezone. "
+        "All pairing decisions are made in this timezone, independent of "
+        "the Odoo server's system timezone.",
+    )
+    cutoff_hour = fields.Integer(
+        string="Night-Shift Cutoff Hour",
+        default=6,
+        help="Punches on a new calendar day *before* this hour close the "
+        "previous day's open record (night-shift check-out). Punches at or "
+        "after this hour start a new check-in and any stale open record is "
+        "force-closed at this hour.",
+    )
+    last_sync_time = fields.Datetime(
+        string="Last Synced Punch",
+        readonly=True,
+        copy=False,
+        help="Watermark (UTC): punches at/before this time are staged but "
+        "never re-paired into HR attendance. This makes wiping the staging "
+        "table ('Clear Data') safe: the next sync re-downloads the device "
+        "history without rewriting existing attendance records.",
+    )
+
+    @api.constrains("machine_timezone")
+    def _check_machine_timezone(self):
+        for rec in self:
+            try:
+                pytz.timezone(rec.machine_timezone)
+            except pytz.exceptions.UnknownTimeZoneError:
+                raise ValidationError(
+                    _("Unknown timezone: %s") % rec.machine_timezone
+                )
 
     def device_connect(self, zk):
         try:
@@ -230,12 +265,23 @@ class ZkMachine(models.Model):
                     for r in existing_zk
                 }
 
-                local_tz = pytz.timezone(self.env.user.partner_id.tz or "GMT")
+                # All punch/pairing math happens in the machine's wall-clock
+                # timezone.  hr.attendance stores naive UTC.
+                wall_tz = pytz.timezone(info.machine_timezone)
+                watermark = info.last_sync_time  # naive UTC or None
+                max_punch_utc = None
 
-                attendance.sort(key=lambda x: int(x.user_id))
+                def _uid_key(punch):
+                    # pyzk user_id may be str or int; sort/group consistently.
+                    try:
+                        return int(punch.user_id)
+                    except (TypeError, ValueError):
+                        return punch.user_id
+
+                attendance.sort(key=_uid_key)
                 grouped_attendances = [
                     list(group)
-                    for _, group in groupby(attendance, key=lambda x: x.user_id)
+                    for _, group in groupby(attendance, key=_uid_key)
                 ]
 
                 non_existence_employees = []
@@ -255,30 +301,20 @@ class ZkMachine(models.Model):
                                 non_existence_employees.append(device_user)
                         continue
 
-                    # Fetch all existing hr.attendance records for
-                    # this employee once per user, not once per punch record.
-                    db_attendances = att_obj.search(
-                        [("employee_id", "=", employee.id)],
-                        order="id",
-                    )
-
                     for attendance_rec in each_user_attendances:
-                        atten_time = datetime.strptime(
-                            attendance_rec.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                            "%Y-%m-%d %H:%M:%S",
+                        wall_local = zk_pairing.to_wall_local(
+                            attendance_rec.timestamp, wall_tz
                         )
-                        local_dt = local_tz.localize(atten_time, is_dst=None)
-                        utc_dt = local_dt.astimezone(pytz.utc)
-                        atten_time = datetime.strptime(
-                            utc_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                            "%Y-%m-%d %H:%M:%S",
-                        )
+                        atten_time = zk_pairing.to_naive_utc(wall_local)
                         atten_time_str = fields.Datetime.to_string(atten_time)
 
                         if (str(user_id), atten_time_str) in existing_zk_set:
                             continue
 
-                        # Record is new — insert into zk_attendance staging table
+                        # Record is new — insert into zk_attendance staging
+                        # table.  Staging insert and HR pairing commit in the
+                        # same transaction, so "already staged" always implies
+                        # "already paired".
                         zk_attendance.create(
                             {
                                 "employee_id": employee.id,
@@ -292,42 +328,69 @@ class ZkMachine(models.Model):
                         # Add to the in-memory set so subsequent records in this
                         # batch don't trigger duplicate DB inserts
                         existing_zk_set.add((str(user_id), atten_time_str))
+                        if max_punch_utc is None or atten_time > max_punch_utc:
+                            max_punch_utc = atten_time
 
-                        # Get the single most recent hr.attendance record whose
-                        # check_in is before the current punch time.
-                        prior = [r for r in db_attendances if r.check_in <= atten_time]
-                        record = prior[-1] if prior else None
+                        # Watermark: punches at/before the last synced punch are
+                        # history being re-staged (e.g. after 'Clear Data' wiped
+                        # the staging table).  They are never re-paired, which
+                        # prevents the re-sync from rewriting/overwriting
+                        # existing hr.attendance records.
+                        if watermark and atten_time <= watermark:
+                            continue
 
-                        if record:
-                            check_in = record.check_in
-                            check_out = record.check_out
-                            check_in_local = check_in.astimezone(local_tz)
-
-                            same_day = local_dt.date() == check_in_local.date()
-                            within_24h = (local_dt - check_in_local) / timedelta(
-                                hours=1
-                            ) < 24
-                            open_and_recent = not check_out and (same_day or within_24h)
-                            same_day_checkout = (
-                                check_out
-                                and check_out.astimezone(local_tz).date()
-                                == local_dt.date()
+                        # Pair with the employee's newest OPEN record
+                        # (check_out unset).  Punches toggle: they close the
+                        # open record, otherwise they start a new check-in.
+                        open_rec = att_obj.search(
+                            [
+                                ("employee_id", "=", employee.id),
+                                ("check_out", "=", False),
+                            ],
+                            order="check_in desc",
+                            limit=1,
+                        )
+                        if open_rec:
+                            ci_local = zk_pairing.to_aware_utc(
+                                open_rec.check_in
+                            ).astimezone(wall_tz)
+                            action = zk_pairing.pairing_decision(
+                                wall_local, ci_local, info.cutoff_hour
                             )
-
-                            if open_and_recent or same_day_checkout:
-                                record.write({"check_out": atten_time})
+                            if action == "ignore":
+                                _logger.warning(
+                                    "Punch %s for device %s (%s) is at/before "
+                                    "open record %s check_in %s; staged only.",
+                                    atten_time_str,
+                                    user_id,
+                                    employee.name,
+                                    open_rec.id,
+                                    open_rec.check_in,
+                                )
                                 continue
-                            # else: record is too old or already closed on a different
-                            # day — fall through to create a new check-in below
-
-                        # No suitable open record found — create a new check-in
-                        new_rec = att_obj.create(
+                            if action == "close":
+                                open_rec.write({"check_out": atten_time})
+                                continue
+                            # 'cutoff': stale open record from a previous day —
+                            # force-close it at the daily cutoff, the punch
+                            # starts a new working day.
+                            close_utc = zk_pairing.to_naive_utc(
+                                zk_pairing.cutoff_moment(
+                                    ci_local, wall_tz, info.cutoff_hour
+                                )
+                            )
+                            open_rec.write(
+                                {"check_out": max(close_utc, open_rec.check_in)}
+                            )
+                        att_obj.create(
                             {
                                 "employee_id": employee.id,
                                 "check_in": atten_time,
                             }
                         )
-                        db_attendances |= new_rec
+
+                if max_punch_utc and (not watermark or max_punch_utc > watermark):
+                    info.last_sync_time = max_punch_utc
 
                 if non_existence_employees:
                     self.non_existence_employee_error(non_existence_employees)
